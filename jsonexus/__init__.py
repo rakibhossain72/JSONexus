@@ -1,6 +1,6 @@
 """JSONexus - a modular JSON document database."""
 
-from jsonexus.core.database import JSONexus
+from jsonexus._rust_engine import JSONexus
 
 __version__ = "1.1.0"
 

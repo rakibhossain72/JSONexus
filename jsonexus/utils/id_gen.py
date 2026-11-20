@@ -1,13 +1,5 @@
-"""ID generation utilities for JSONexus."""
+"""ID generation utilities (Rust engine re-export)."""
 
-import uuid
+from jsonexus._rust_engine import generate_id, short_id
 
-
-def generate_id() -> str:
-    """Generate a full-length unique identifier as a hex string."""
-    return str(uuid.uuid4())
-
-
-def short_id() -> str:
-    """Generate a compact 8-character unique identifier."""
-    return uuid.uuid4().hex[:8]
+__all__ = ["generate_id", "short_id"]

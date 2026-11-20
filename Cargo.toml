@@ -1,0 +1,18 @@
+[package]
+name = "jsonexus-engine"
+version = "1.1.0"
+edition = "2021"
+description = "Rust engine for the JSONexus document database"
+license = "MIT"
+
+[lib]
+name = "_rust_engine"
+crate-type = ["cdylib", "rlib"]
+path = "src/rust_engine/lib.rs"
+
+[dependencies]
+pyo3 = "0.30"
+pythonize = "0.30"
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

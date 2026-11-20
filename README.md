@@ -58,37 +58,47 @@ match_result = db.match('users', {"name": "Carol", "age": 35})
 
 ## Architecture
 
-- `jsonexus/utils/` — shared types, ID generation, and input validation.
-- `jsonexus/storage/` — storage backend ABC and file backend with atomic writes (temp file + `os.replace`) using `orjson`.
-- `jsonexus/query/` — query parser, operator implementations, and a single shared evaluator (`EVALUATOR`). Supports `$eq,$ne,$gt,$gte,$lt,$lte,$in,$nin,$exists,$regex,$size,$all,$mod,$elemMatch`, `$and/$or/$nor`, dotted paths, and legacy `{_op,_value}` style.
-- `jsonexus/indexing/` — `HashIndex`, `RangeIndex`, and `IndexManager` for lazy per-field auto-indexing.
-- `jsonexus/collections/` — `Collection` document store (insert, find, update, delete, match, etc.).
-- `jsonexus/core/` — `JSONexus` database coordinator (public API, persistence, flush/close/context manager).
+The engine is written in Rust and bound to Python with PyO3. Documents are kept
+as live Python dicts across the FFI boundary, so identity, equality, ordering and
+nested JSON values behave exactly as before.
+
+- `src/rust_engine/storage/` — storage backend trait and atomic JSON file backend (temp file + rename).
+- `src/rust_engine/query/` — parser, operators, and a single evaluator used by find/update/delete/match. Supports `$eq,$ne,$gt,$gte,$lt,$lte,$in,$nin,$exists,$regex,$size,$all,$mod,$elemMatch`, `$and/$or/$nor`, dotted paths, and legacy `{_op,_value}` style.
+- `src/rust_engine/indexing/` — `HashIndex`, `RangeIndex`, and `IndexManager` for lazy per-field auto-indexing.
+- `src/rust_engine/collections/` — `Collection` document store (insert, find, update, delete, match, etc.).
+- `src/rust_engine/core/` — `JSONexus` coordinator (public API, persistence, flush/close/context manager).
+- `jsonexus/` — thin Python re-export shims that keep the existing import paths.
 
 ## Performance
 
-- `orjson` serialization for fast reads/writes.
-- Lazy per-field hash and range indexes: O(1) equality lookups and O(log n) range scans (index built on first relevant query). Measured on 50,000 documents, an equality `find` drops from **35 ms (first pass, builds index) to 2 ms (indexed)** — roughly a **17x** speedup.
-- Single shared query evaluator (deduplicated from the original four copies) used by find/update/delete/match paths.
-- Atomic batched writes via temp-file + `os.replace`.
+- Rust query evaluation, indexing and JSON serialization (no Python round-trip at the FFI boundary).
+- Lazy per-field hash and range indexes: O(1) equality lookups and O(log n) range scans (index built on first relevant query).
+- Atomic batched writes via temp-file + rename.
 
-Measured on 50,000 documents (see `benchmark.py`):
+Measured on 50,000 documents (median of 5 runs, see `benchmark.py`), compared
+with the previous pure-Python engine on CPython 3.14:
 
-| Operation                                     | Seconds |
-| --------------------------------------------- | ------- |
-| bulk insert_many (50k docs)                   | 0.13    |
-| equality find (first, builds index)           | 0.035   |
-| equality find (second, indexed)               | 0.002   |
-| range find ($gte/$lte on age)                 | 0.066   |
-| update by query (age range)                   | 0.024   |
-| delete by query (category)                    | 0.065   |
-| full count (rescan)                           | 0.00003 |
+| Operation                            | Python  | Rust    | Speedup |
+| ------------------------------------ | ------- | ------- | ------- |
+| bulk insert_many (50k docs)          | 0.141 s | 0.054 s | 2.60x   |
+| equality find (first, builds index)  | 0.036 s | 0.026 s | 1.38x   |
+| equality find (second, indexed)      | 0.003 s | 0.003 s | 1.05x   |
+| range find ($gte/$lte on age)        | 0.069 s | 0.042 s | 1.66x   |
+| update by query (age range)          | 0.024 s | 0.035 s | 0.68x   |
+| delete by query (category)           | 0.064 s | 0.066 s | 0.96x   |
+| full count (rescan)                  | 0.000 s | 0.000 s | 1.83x   |
+| **total of listed operations**       | 0.336 s | 0.226 s | **1.48x** |
 
 ## Development
 
+Building the extension requires a Rust toolchain and `maturin`:
+
 ```bash
+pip install maturin
 pip install -e .
 pytest tests/
+cargo test
+cargo clippy --all-targets
 python benchmark.py
 ```
 
