@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use ahash::RandomState;
+
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -24,10 +26,16 @@ use crate::utils::validation::{
     validate_document, validate_query, validate_update_fields,
 };
 
+/// Fast id -> position map. SipHash is needlessly slow for millions of UUIDs.
+pub type IdMap = HashMap<String, usize, RandomState>;
+
 pub struct CollectionState {
     pub name: String,
     pub documents: Py<PyList>,
-    pub by_id: HashMap<String, usize>,
+    pub by_id: IdMap,
+    /// Set when an operation may have desynchronised `_id`s from `by_id`
+    /// (legacy `insert_no_duplicate` strips `_id`, and updates may replace it).
+    pub by_id_dirty: bool,
     pub indexes: Py<IndexManager>,
 }
 
@@ -42,8 +50,11 @@ fn document_id(dict: &Bound<'_, PyDict>) -> PyResult<String> {
     }
 }
 
-pub fn rebuild_id_index(documents: &Bound<'_, PyList>) -> PyResult<HashMap<String, usize>> {
-    let mut by_id = HashMap::new();
+pub fn rebuild_id_index(documents: &Bound<'_, PyList>) -> PyResult<IdMap> {
+    let mut by_id = IdMap::with_capacity_and_hasher(
+        documents.len(),
+        RandomState::default(),
+    );
     for (index, document) in documents.iter().enumerate() {
         let dict = document
             .cast::<PyDict>()
@@ -66,6 +77,7 @@ pub fn state_from_list(
         name,
         documents,
         by_id,
+        by_id_dirty: false,
         indexes,
     })
 }
@@ -105,6 +117,10 @@ fn mark_dirty(py: Python<'_>, state: &CollectionState) {
     state.indexes.borrow(py).mark_dirty(py);
 }
 
+fn mark_range_dirty(py: Python<'_>, state: &CollectionState) {
+    state.indexes.borrow(py).mark_range_dirty(py);
+}
+
 fn result_dict(
     py: Python<'_>,
     status: &str,
@@ -134,7 +150,8 @@ pub fn insert(
     validate_document(data)?;
     ensure_id(py, data)?;
     append_document(py, state, data)?;
-    mark_dirty(py, state);
+    state.indexes.borrow(py).on_insert(py, data)?;
+    mark_range_dirty(py, state);
     result_dict(py, "success", Some(data))
 }
 
@@ -144,6 +161,8 @@ pub fn insert_no_duplicate(
     data: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     validate_document(data)?;
+    // The legacy comparison strips `_id` from existing documents.
+    state.by_id_dirty = true;
     let documents = state.documents.clone_ref(py);
     let length = documents.bind(py).len();
 
@@ -175,27 +194,27 @@ pub fn insert_many(
     let list = data_list
         .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("data_list must be a list"))?;
+    state.by_id.reserve(list.len());
     for item in list.iter() {
         validate_document(&item)?;
         ensure_id(py, &item)?;
         append_document(py, state, &item)?;
+        state.indexes.borrow(py).on_insert(py, &item)?;
     }
-    mark_dirty(py, state);
+    mark_range_dirty(py, state);
     status_dict(py, "success")
 }
 
-fn resolve_ids(
+fn resolve_indices(
     py: Python<'_>,
     state: &CollectionState,
-    ids: impl IntoIterator<Item = String>,
+    indices: impl IntoIterator<Item = usize>,
 ) -> PyResult<Py<PyList>> {
     let documents = state.documents.clone_ref(py);
     let documents = documents.bind(py);
     let mut out: Vec<Py<PyAny>> = Vec::new();
-    for id in ids {
-        if let Some(&index) = state.by_id.get(&id) {
-            out.push(documents.get_item(index)?.unbind());
-        }
+    for index in indices {
+        out.push(documents.get_item(index)?.unbind());
     }
     Ok(PyList::new(py, out)?.unbind())
 }
@@ -211,8 +230,29 @@ fn hash_lookup(
         .indexes
         .borrow_mut(py)
         .hash_for(py, field, documents.bind(py).as_any())?;
-    let ids = index.borrow(py).get_ids(py, value)?;
-    resolve_ids(py, state, ids)
+    let documents = index.borrow(py).docs_for(py, value)?;
+    Ok(documents)
+}
+
+fn range_lookup(
+    py: Python<'_>,
+    state: &mut CollectionState,
+    field: &str,
+    low: Option<&Bound<'_, PyAny>>,
+    high: Option<&Bound<'_, PyAny>>,
+    inclusive_low: bool,
+    inclusive_high: bool,
+) -> PyResult<Py<PyList>> {
+    let documents = state.documents.clone_ref(py);
+    let index = state.indexes.borrow_mut(py).range_for(
+        py,
+        field,
+        documents.bind(py).as_any(),
+    )?;
+    let indices = index
+        .borrow(py)
+        .range_indices(low, high, inclusive_low, inclusive_high)?;
+    resolve_indices(py, state, indices)
 }
 
 fn range_or_scan(
@@ -229,17 +269,15 @@ fn range_or_scan(
         "$lte" => (None, Some(operand), true, true),
         _ => return Ok(None),
     };
-
-    let documents = state.documents.clone_ref(py);
-    let index = state.indexes.borrow_mut(py).range_for(
+    Ok(Some(range_lookup(
         py,
+        state,
         field,
-        documents.bind(py).as_any(),
-    )?;
-    let ids = index
-        .borrow(py)
-        .range_ids(py, low, high, inclusive_low, inclusive_high)?;
-    Ok(Some(resolve_ids(py, state, ids)?))
+        low,
+        high,
+        inclusive_low,
+        inclusive_high,
+    )?))
 }
 
 fn indexed_find(
@@ -269,23 +307,47 @@ fn indexed_find(
     }
 
     if let Ok(value_dict) = value.cast::<PyDict>() {
-        if let Some(operand) = value_dict.get_item("$eq")? {
-            return Ok(Some(hash_lookup(py, state, &field, &operand)?));
+        if value_dict.len() == 1 {
+            if let Some(operand) = value_dict.get_item("$eq")? {
+                return Ok(Some(hash_lookup(py, state, &field, &operand)?));
+            }
         }
-        if let (true, Some(operand)) = (
-            value_dict.contains("_op")?,
-            value_dict.get_item("_value")?,
-        ) {
-            let op_obj = value_dict.get_item("_op")?.expect("checked _op");
-            if let Ok(op) = op_obj.extract::<String>() {
-                return range_or_scan(py, state, &field, &op, &operand);
+        if value_dict.len() == 2 && value_dict.contains("_op")? {
+            if let Some(operand) = value_dict.get_item("_value")? {
+                let op_obj = value_dict.get_item("_op")?.expect("checked _op");
+                if let Ok(op) = op_obj.extract::<String>() {
+                    return range_or_scan(py, state, &field, &op, &operand);
+                }
             }
             return Ok(None);
         }
-        for op in ["$gt", "$gte", "$lt", "$lte"] {
-            if let Some(operand) = value_dict.get_item(op)? {
-                return range_or_scan(py, state, &field, op, &operand);
+
+        // Combine every range operator in the dict into one index lookup;
+        // returning after the first one would drop the other bounds.
+        let mut low: Option<(Bound<'_, PyAny>, bool)> = None;
+        let mut high: Option<(Bound<'_, PyAny>, bool)> = None;
+        for (key, operand) in value_dict.iter() {
+            let Ok(op) = key.extract::<String>() else {
+                return Ok(None);
+            };
+            match op.as_str() {
+                "$gt" => low = Some((operand, false)),
+                "$gte" => low = Some((operand, true)),
+                "$lt" => high = Some((operand, false)),
+                "$lte" => high = Some((operand, true)),
+                _ => return Ok(None),
             }
+        }
+        if low.is_some() || high.is_some() {
+            return Ok(Some(range_lookup(
+                py,
+                state,
+                &field,
+                low.as_ref().map(|(bound, _)| bound),
+                high.as_ref().map(|(bound, _)| bound),
+                low.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+                high.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+            )?));
         }
     }
 
@@ -343,6 +405,7 @@ pub fn get(
 
     if index >= documents_ref.len() {
         state.by_id = rebuild_id_index(documents_ref)?;
+        state.by_id_dirty = false;
         match state.by_id.get(&key).copied() {
             Some(found) => index = found,
             None => return Ok(None),
@@ -359,6 +422,7 @@ pub fn get(
     }
 
     state.by_id = rebuild_id_index(documents_ref)?;
+    state.by_id_dirty = false;
     match state.by_id.get(&key).copied() {
         Some(found) => Ok(Some(documents_ref.get_item(found)?.unbind())),
         None => Ok(None),
@@ -376,6 +440,9 @@ pub fn update(
 
     let query_dict = query.cast::<PyDict>().expect("validated query");
     let fields = update_fields.cast::<PyDict>().expect("validated fields");
+    if fields.contains("_id")? {
+        state.by_id_dirty = true;
+    }
 
     let mut simple_single = false;
     if query_dict.len() == 1 {
@@ -388,17 +455,22 @@ pub fn update(
 
     let matches = find(py, state, query)?;
     for document in matches.bind(py).iter() {
+        let snapshots = state.indexes.borrow(py).snapshot_hash(py, &document)?;
         let dict = document.cast::<PyDict>()?;
         for (key, value) in fields.iter() {
             dict.set_item(key, value)?;
         }
+        state
+            .indexes
+            .borrow(py)
+            .on_update(py, &document, &snapshots)?;
         if simple_single {
-            mark_dirty(py, state);
+            mark_range_dirty(py, state);
             return status_dict(py, "success");
         }
     }
 
-    mark_dirty(py, state);
+    mark_range_dirty(py, state);
     status_dict(py, "success")
 }
 
@@ -410,14 +482,20 @@ pub fn update_by_id(
 ) -> PyResult<Py<PyAny>> {
     validate_update_fields(update_fields)?;
     let fields = update_fields.cast::<PyDict>().expect("validated fields");
+    if fields.contains("_id")? {
+        state.by_id_dirty = true;
+    }
 
     if let Some(document) = get(py, state, document_id)? {
-        let dict = document.bind(py).cast::<PyDict>()?;
+        let bound = document.bind(py);
+        let snapshots = state.indexes.borrow(py).snapshot_hash(py, bound)?;
+        let dict = bound.cast::<PyDict>()?;
         for (key, value) in fields.iter() {
             dict.set_item(key, value)?;
         }
+        state.indexes.borrow(py).on_update(py, bound, &snapshots)?;
     }
-    mark_dirty(py, state);
+    mark_range_dirty(py, state);
     status_dict(py, "success")
 }
 
@@ -433,22 +511,48 @@ pub fn delete(
         let mut removed: HashSet<usize> = HashSet::new();
         for document in matches.bind(py).iter() {
             removed.insert(document.as_ptr() as usize);
+            // Keep built hash indexes valid; range indexes are invalidated
+            // below because sorted positions would have to shift.
+            state.indexes.borrow(py).on_remove(py, &document)?;
         }
 
         let documents = state.documents.clone_ref(py);
-        let mut kept: Vec<Py<PyAny>> = Vec::new();
-        for document in documents.bind(py).iter() {
-            if !removed.contains(&(document.as_ptr() as usize)) {
-                kept.push(document.unbind());
-            }
-        }
         let list = documents.bind(py);
-        list.call_method0("clear")?;
-        list.call_method1("extend", (PyList::new(py, kept)?,))?;
-        state.by_id = rebuild_id_index(list)?;
+        let old_len = list.len();
+        let mut positions = vec![usize::MAX; old_len];
+        let mut kept: Vec<Py<PyAny>> = Vec::with_capacity(old_len - removed.len());
+        for (old_index, document) in list.iter().enumerate() {
+            if removed.contains(&(document.as_ptr() as usize)) {
+                continue;
+            }
+            positions[old_index] = kept.len();
+            kept.push(document.unbind());
+        }
+
+        if state.by_id_dirty {
+            // A previous destructive operation left `_id`s out of sync; do a
+            // full rebuild so stale ids disappear exactly like the old engine.
+            list.call_method0("clear")?;
+            list.call_method1("extend", (PyList::new(py, kept)?,))?;
+            state.by_id = rebuild_id_index(list)?;
+            state.by_id_dirty = false;
+        } else {
+            // Remap positions in place instead of rehashing every id string.
+            state.by_id.retain(|_, index| {
+                let new_index = positions.get(*index).copied().unwrap_or(usize::MAX);
+                if new_index == usize::MAX {
+                    false
+                } else {
+                    *index = new_index;
+                    true
+                }
+            });
+            list.call_method0("clear")?;
+            list.call_method1("extend", (PyList::new(py, kept)?,))?;
+        }
     }
 
-    mark_dirty(py, state);
+    mark_range_dirty(py, state);
     status_dict(py, "success")
 }
 
@@ -469,13 +573,15 @@ pub fn delete_by_id(
                 None => false,
             };
             if same {
+                state.indexes.borrow(py).on_remove(py, &document)?;
                 documents_ref.del_item(index)?;
                 state.by_id = rebuild_id_index(documents_ref)?;
+                state.by_id_dirty = false;
             }
         }
     }
 
-    mark_dirty(py, state);
+    mark_range_dirty(py, state);
     status_dict(py, "success")
 }
 

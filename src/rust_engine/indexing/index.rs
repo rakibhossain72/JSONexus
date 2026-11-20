@@ -6,15 +6,14 @@
 //! * `RangeIndex` — sorted `(value, id)` list, ordered with Python's own sort
 //!   so mixed-type fields raise exactly the same `TypeError` as the original.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString};
 
 use crate::query::evaluator::path_get;
-use crate::query::operators::rich_compare;
 use crate::utils::types::DocumentId;
 
 fn is_type_error(py: Python<'_>, err: &PyErr) -> bool {
@@ -25,12 +24,12 @@ fn py_str(value: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(value.str()?.to_string_lossy().into_owned())
 }
 
-fn document_id(document: &Bound<'_, PyAny>) -> PyResult<String> {
+fn document_id_obj<'py>(document: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let dict = document
         .cast::<PyDict>()
         .map_err(|_| PyTypeError::new_err("Document must be a dict"))?;
     match dict.get_item("_id")? {
-        Some(id) => py_str(&id),
+        Some(id) => Ok(id),
         None => Err(PyKeyError::new_err("_id")),
     }
 }
@@ -47,6 +46,85 @@ pub struct HashIndex {
 }
 
 impl HashIndex {
+    /// Store `document` under `value` in the inner id -> document mapping.
+    pub fn insert_document(
+        &mut self,
+        py: Python<'_>,
+        value: Option<&Bound<'_, PyAny>>,
+        id: &Bound<'_, PyAny>,
+        document: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let value = match value {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        let map = self.map.bind(py);
+        let existing = match map.get_item(value) {
+            Ok(existing) => existing,
+            Err(err) if is_type_error(py, &err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        match existing {
+            Some(inner) => {
+                inner.cast::<PyDict>()?.set_item(id, document)?;
+            }
+            None => {
+                let inner = PyDict::new(py);
+                inner.set_item(id, document)?;
+                map.set_item(value, inner)?;
+            }
+        }
+        if !self.dirty.is_empty() {
+            self.dirty.remove(&py_str(id)?);
+        }
+        Ok(())
+    }
+
+    /// Remove `id` from the bucket stored at `value` (if present).
+    pub fn remove_value(
+        &mut self,
+        py: Python<'_>,
+        value: Option<&Bound<'_, PyAny>>,
+        id: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let value = match value {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        let map = self.map.bind(py);
+        let existing = match map.get_item(value) {
+            Ok(existing) => existing,
+            Err(err) if is_type_error(py, &err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if let Some(inner) = existing {
+            let inner = inner.cast::<PyDict>()?;
+            if inner.contains(id)? {
+                inner.del_item(id)?;
+            }
+            if inner.len() == 0 {
+                map.del_item(value)?;
+            }
+        }
+        if !self.dirty.is_empty() {
+            self.dirty.remove(&py_str(id)?);
+        }
+        Ok(())
+    }
+
+    pub fn update_values(
+        &mut self,
+        py: Python<'_>,
+        old_value: Option<&Bound<'_, PyAny>>,
+        new_value: Option<&Bound<'_, PyAny>>,
+        old_id: &Bound<'_, PyAny>,
+        new_id: &Bound<'_, PyAny>,
+        document: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.remove_value(py, old_value, old_id)?;
+        self.insert_document(py, new_value, new_id, document)
+    }
+
     pub fn new_index(py: Python<'_>, field_path: String) -> Self {
         Self {
             field_path,
@@ -60,21 +138,21 @@ impl HashIndex {
         self.built
     }
 
-    pub fn get_ids(
+    /// Documents stored for an equality value, ready to return to Python.
+    pub fn docs_for(
         &self,
         py: Python<'_>,
         value: &Bound<'_, PyAny>,
-    ) -> PyResult<HashSet<DocumentId>> {
-        let mut out = HashSet::new();
-        if let Some(set) = self.map.bind(py).get_item(value)? {
-            let set = set
-                .cast::<PySet>()
-                .map_err(|_| PyTypeError::new_err("Index entry is not a set"))?;
-            for id in set.iter() {
-                out.insert(py_str(&id)?);
+    ) -> PyResult<Py<PyList>> {
+        match self.map.bind(py).get_item(value)? {
+            Some(inner) => {
+                let inner = inner
+                    .cast::<PyDict>()
+                    .map_err(|_| PyTypeError::new_err("Index entry is not a dict"))?;
+                Ok(inner.values().unbind())
             }
+            None => Ok(PyList::empty(py).unbind()),
         }
-        Ok(out)
     }
 
     pub fn rebuild_index(
@@ -104,56 +182,22 @@ impl HashIndex {
         self.built
     }
 
-    fn add(&mut self, py: Python<'_>, document: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub fn add(&mut self, py: Python<'_>, document: &Bound<'_, PyAny>) -> PyResult<()> {
         let value = match path_get(document, &self.field_path)? {
             Some(value) => value,
             None => return Ok(()),
         };
-        let map = self.map.bind(py);
-        // Mirrors `_hashable()`: unhashable values are silently skipped.
-        let existing = match map.get_item(value.bind(py)) {
-            Ok(existing) => existing,
-            Err(err) if is_type_error(py, &err) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        let id = document_id(document)?;
-
-        match existing {
-            Some(set) => {
-                set.cast::<PySet>()?.add(id.clone())?;
-            }
-            None => {
-                let set = PySet::empty(py)?;
-                set.add(id.clone())?;
-                map.set_item(value.bind(py), set)?;
-            }
-        }
-        self.dirty.remove(&id);
-        Ok(())
+        let id = document_id_obj(document)?;
+        self.insert_document(py, Some(value.bind(py)), &id, document)
     }
 
-    fn remove(&mut self, py: Python<'_>, document: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub fn remove(&mut self, py: Python<'_>, document: &Bound<'_, PyAny>) -> PyResult<()> {
         let value = match path_get(document, &self.field_path)? {
             Some(value) => value,
             None => return Ok(()),
         };
-        let map = self.map.bind(py);
-        let existing = match map.get_item(value.bind(py)) {
-            Ok(existing) => existing,
-            Err(err) if is_type_error(py, &err) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        let id = document_id(document)?;
-
-        if let Some(set) = existing {
-            let set = set.cast::<PySet>()?;
-            set.discard(id.clone())?;
-            if set.len() == 0 {
-                map.del_item(value.bind(py))?;
-            }
-        }
-        self.dirty.remove(&id);
-        Ok(())
+        let id = document_id_obj(document)?;
+        self.remove_value(py, Some(value.bind(py)), &id)
     }
 
     fn update(
@@ -181,11 +225,15 @@ impl HashIndex {
         self.rebuild_index(py, documents)
     }
 
-    fn get(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Py<PySet>> {
-        let ids = self.get_ids(py, value)?;
+    pub fn get(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Py<PySet>> {
         let set = PySet::empty(py)?;
-        for id in ids {
-            set.add(id)?;
+        if let Some(inner) = self.map.bind(py).get_item(value)? {
+            let inner = inner
+                .cast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("Index entry is not a dict"))?;
+            for (id, _) in inner.iter() {
+                set.add(id)?;
+            }
         }
         Ok(set.unbind())
     }
@@ -206,56 +254,109 @@ fn comparable(value: &Bound<'_, PyAny>) -> bool {
         || value.is_instance_of::<PyString>()
 }
 
-fn entry_value<'py>(
-    entries: &Bound<'py, PyList>,
+#[derive(Clone)]
+enum RangeKey {
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl RangeKey {
+    fn is_numeric(&self) -> bool {
+        !matches!(self, RangeKey::Str(_))
+    }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (RangeKey::Int(a), RangeKey::Int(b)) => a.cmp(b),
+            (RangeKey::Float(a), RangeKey::Float(b)) => {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+            (RangeKey::Int(a), RangeKey::Float(b)) => {
+                (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+            (RangeKey::Float(a), RangeKey::Int(b)) => {
+                a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+            }
+            (RangeKey::Str(a), RangeKey::Str(b)) => a.cmp(b),
+            // Mixed categories are rejected before sorting/searching.
+            _ => Ordering::Equal,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            RangeKey::Int(_) => "int",
+            RangeKey::Float(_) => "float",
+            RangeKey::Str(_) => "str",
+        }
+    }
+}
+
+struct RangeEntry {
+    key: RangeKey,
     index: usize,
-) -> PyResult<Bound<'py, PyAny>> {
-    entries.get_item(index)?.get_item(0)
+    id: Py<PyAny>,
 }
 
-fn is_lt(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<bool> {
-    rich_compare(a, b, CompareOp::Lt)
-}
-
-fn bisect_left(entries: &Bound<'_, PyList>, key: &Bound<'_, PyAny>) -> PyResult<usize> {
-    let (mut lo, mut hi) = (0usize, entries.len());
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if is_lt(&entry_value(entries, mid)?, key)? {
-            lo = mid + 1;
+fn value_key(value: &Bound<'_, PyAny>, allow_bool: bool) -> Option<RangeKey> {
+    if value.is_instance_of::<PyBool>() {
+        if !allow_bool {
+            return None;
+        }
+        return Some(RangeKey::Int(if value.extract::<bool>().ok()? {
+            1
         } else {
-            hi = mid;
+            0
+        }));
+    }
+    if let Ok(text) = value.cast::<PyString>() {
+        return Some(RangeKey::Str(text.to_string_lossy().into_owned()));
+    }
+    if let Ok(integer) = value.cast::<PyInt>() {
+        if let Ok(number) = integer.extract::<i64>() {
+            return Some(RangeKey::Int(number));
+        }
+        if let Ok(number) = integer.extract::<f64>() {
+            return Some(RangeKey::Float(number));
+        }
+        return None;
+    }
+    if let Ok(float) = value.cast::<PyFloat>() {
+        return Some(RangeKey::Float(float.value()));
+    }
+    None
+}
+
+fn operand_key(value: &Bound<'_, PyAny>) -> PyResult<RangeKey> {
+    match value_key(value, true) {
+        Some(key) => Ok(key),
+        None => {
+            let type_name = value
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "object".to_string());
+            Err(PyTypeError::new_err(format!(
+                "'<' not supported between instances of '{type_name}'",
+            )))
         }
     }
-    Ok(lo)
-}
-
-fn bisect_right(entries: &Bound<'_, PyList>, key: &Bound<'_, PyAny>) -> PyResult<usize> {
-    let (mut lo, mut hi) = (0usize, entries.len());
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if is_lt(key, &entry_value(entries, mid)?)? {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    Ok(lo)
 }
 
 #[pyclass(module = "jsonexus.indexing.index", name = "RangeIndex")]
 pub struct RangeIndex {
     #[pyo3(get)]
     pub field_path: String,
-    entries: Py<PyList>,
+    entries: Vec<RangeEntry>,
     built: bool,
 }
 
 impl RangeIndex {
-    pub fn new_index(py: Python<'_>, field_path: String) -> Self {
+    pub fn new_index(field_path: String) -> Self {
         Self {
             field_path,
-            entries: PyList::empty(py).unbind(),
+            entries: Vec::new(),
             built: false,
         }
     }
@@ -269,8 +370,12 @@ impl RangeIndex {
         py: Python<'_>,
         documents: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let entries = PyList::empty(py);
-        for document in documents.try_iter()? {
+        let capacity = documents.len().unwrap_or(0);
+        let mut entries: Vec<RangeEntry> = Vec::with_capacity(capacity);
+        let mut saw_numeric = false;
+        let mut saw_text = false;
+
+        for (index, document) in documents.try_iter()?.enumerate() {
             let document = document?;
             let value = match path_get(&document, &self.field_path)? {
                 Some(value) => value,
@@ -279,74 +384,148 @@ impl RangeIndex {
             if !comparable(value.bind(py)) {
                 continue;
             }
-            let id = document_id(&document)?;
-            let id_obj = PyString::new(py, &id);
-            let tuple = PyTuple::new(py, [value, id_obj.into_any().unbind()])?;
-            entries.append(tuple)?;
+            let key = match value_key(value.bind(py), false) {
+                Some(key) => key,
+                None => continue,
+            };
+            if key.is_numeric() {
+                saw_numeric = true;
+            } else {
+                saw_text = true;
+            }
+            let id = document_id_obj(&document)?;
+            entries.push(RangeEntry {
+                key,
+                index,
+                id: id.unbind(),
+            });
         }
 
-        let operator = py.import("operator")?;
-        let key = operator.getattr("itemgetter")?.call1((0,))?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("key", key)?;
-        entries.call_method("sort", (), Some(&kwargs))?;
+        if saw_numeric && saw_text {
+            return Err(PyTypeError::new_err(
+                "'<' not supported between instances of 'str' and 'int'",
+            ));
+        }
+        entries.sort_unstable_by(|a, b| a.key.compare(&b.key));
 
-        self.entries = entries.unbind();
+        self.entries = entries;
         self.built = true;
         Ok(())
     }
 
-    pub fn range_ids(
+    fn bisect_left(&self, key: &RangeKey) -> usize {
+        let (mut lo, mut hi) = (0usize, self.entries.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.entries[mid].key.compare(key) == Ordering::Less {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    fn bisect_right(&self, key: &RangeKey) -> usize {
+        let (mut lo, mut hi) = (0usize, self.entries.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if key.compare(&self.entries[mid].key) == Ordering::Less {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+
+    fn bound_key(
+        &self,
+        value: &Bound<'_, PyAny>,
+        entries_numeric: bool,
+    ) -> PyResult<RangeKey> {
+        let key = operand_key(value)?;
+        if key.is_numeric() != entries_numeric {
+            let left = self.entries[0].key.type_name();
+            let right = key.type_name();
+            return Err(PyTypeError::new_err(format!(
+                "'<' not supported between instances of '{left}' and '{right}'",
+            )));
+        }
+        Ok(key)
+    }
+
+    /// Positions in the document list matched by the range.
+    pub fn range_indices(
+        &self,
+        low: Option<&Bound<'_, PyAny>>,
+        high: Option<&Bound<'_, PyAny>>,
+        inclusive_low: bool,
+        inclusive_high: bool,
+    ) -> PyResult<Vec<usize>> {
+        if self.entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let numeric = self.entries[0].key.is_numeric();
+        let low_key = match low {
+            Some(value) if !value.is_none() => Some(self.bound_key(value, numeric)?),
+            _ => None,
+        };
+        let high_key = match high {
+            Some(value) if !value.is_none() => Some(self.bound_key(value, numeric)?),
+            _ => None,
+        };
+
+        let start = match &low_key {
+            Some(key) => {
+                if inclusive_low {
+                    self.bisect_left(key)
+                } else {
+                    self.bisect_right(key)
+                }
+            }
+            None => 0,
+        };
+        let end = match &high_key {
+            Some(key) => {
+                if inclusive_high {
+                    self.bisect_right(key)
+                } else {
+                    self.bisect_left(key)
+                }
+            }
+            None => self.entries.len(),
+        };
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        Ok(self.entries[start..end]
+            .iter()
+            .map(|entry| entry.index)
+            .collect())
+    }
+
+    pub fn range_objects(
         &self,
         py: Python<'_>,
         low: Option<&Bound<'_, PyAny>>,
         high: Option<&Bound<'_, PyAny>>,
         inclusive_low: bool,
         inclusive_high: bool,
-    ) -> PyResult<Vec<DocumentId>> {
-        let entries = self.entries.bind(py);
-        if entries.len() == 0 {
-            return Ok(Vec::new());
-        }
-
-        let start = match low {
-            Some(low) if !low.is_none() => {
-                if inclusive_low {
-                    bisect_left(entries, low)?
-                } else {
-                    bisect_right(entries, low)?
-                }
-            }
-            _ => 0,
-        };
-        let end = match high {
-            Some(high) if !high.is_none() => {
-                if inclusive_high {
-                    bisect_right(entries, high)?
-                } else {
-                    bisect_left(entries, high)?
-                }
-            }
-            _ => entries.len(),
-        };
-        if start >= end {
-            return Ok(Vec::new());
-        }
-
-        let mut ids = Vec::with_capacity(end - start);
-        for index in start..end {
-            let id = entries.get_item(index)?.get_item(1)?;
-            ids.push(py_str(&id)?);
-        }
-        Ok(ids)
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let indices = self.range_indices(low, high, inclusive_low, inclusive_high)?;
+        Ok(indices
+            .into_iter()
+            .map(|index| self.entries[index].id.clone_ref(py))
+            .collect())
     }
 }
 
 #[pymethods]
 impl RangeIndex {
     #[new]
-    fn new(py: Python<'_>, field_path: String) -> Self {
-        Self::new_index(py, field_path)
+    fn new(field_path: String) -> Self {
+        Self::new_index(field_path)
     }
 
     #[getter]
@@ -358,8 +537,8 @@ impl RangeIndex {
         self.rebuild_index(py, documents)
     }
 
-    pub fn invalidate_all(&mut self, py: Python<'_>) {
-        self.entries = PyList::empty(py).unbind();
+    pub fn invalidate_all(&mut self) {
+        self.entries.clear();
         self.built = false;
     }
 
@@ -374,11 +553,7 @@ impl RangeIndex {
     ) -> PyResult<Py<PyList>> {
         let low_bound = low.as_ref().map(|v| v.bind(py));
         let high_bound = high.as_ref().map(|v| v.bind(py));
-        let ids = self.range_ids(py, low_bound, high_bound, inclusive_low, inclusive_high)?;
-        let out: Vec<Py<PyAny>> = ids
-            .iter()
-            .map(|id| PyString::new(py, id).into_any().unbind())
-            .collect();
-        Ok(PyList::new(py, out)?.unbind())
+        let ids = self.range_objects(py, low_bound, high_bound, inclusive_low, inclusive_high)?;
+        Ok(PyList::new(py, ids)?.unbind())
     }
 }

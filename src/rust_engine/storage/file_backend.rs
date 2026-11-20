@@ -27,97 +27,171 @@ pub fn load_file(py: Python<'_>, path: &Path) -> PyResult<Py<PyAny>> {
     Ok(obj.unbind())
 }
 
-fn write_indent(out: &mut Vec<u8>, level: usize) {
-    for _ in 0..level {
-        out.extend_from_slice(b"  ");
+const FLUSH_AT: usize = 1 << 20;
+const SPACES: &[u8] = b"                                                                ";
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Buffered writer that keeps only ~1 MiB of serialized JSON in memory. At
+/// multi-gigabyte database sizes this replaces a full-size `Vec<u8>` payload
+/// with a stream straight to the temporary file.
+struct JsonSink<'a> {
+    file: &'a mut fs::File,
+    buffer: Vec<u8>,
+}
+
+impl<'a> JsonSink<'a> {
+    fn new(file: &'a mut fs::File) -> Self {
+        Self {
+            file,
+            buffer: Vec::with_capacity(FLUSH_AT),
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> PyResult<()> {
+        if self.buffer.len() + bytes.len() > FLUSH_AT {
+            self.flush()?;
+            if bytes.len() >= FLUSH_AT {
+                self.file.write_all(bytes)?;
+                return Ok(());
+            }
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn byte(&mut self, byte: u8) -> PyResult<()> {
+        if self.buffer.len() == FLUSH_AT {
+            self.flush()?;
+        }
+        self.buffer.push(byte);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        if !self.buffer.is_empty() {
+            self.file.write_all(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
     }
 }
 
-fn write_json_string(out: &mut Vec<u8>, text: &str) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.push(b'"');
-    for &byte in text.as_bytes() {
-        match byte {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x00..=0x1f => {
-                out.extend_from_slice(b"\\u00");
-                out.push(HEX[(byte >> 4) as usize]);
-                out.push(HEX[(byte & 0x0f) as usize]);
-            }
-            _ => out.push(byte),
-        }
+fn write_indent(sink: &mut JsonSink<'_>, level: usize) -> PyResult<()> {
+    let mut remaining = level * 2;
+    while remaining > 0 {
+        let take = remaining.min(SPACES.len());
+        sink.write(&SPACES[..take])?;
+        remaining -= take;
     }
-    out.push(b'"');
+    Ok(())
+}
+
+fn write_json_string(sink: &mut JsonSink<'_>, text: &str) -> PyResult<()> {
+    let bytes = text.as_bytes();
+    sink.byte(b'"')?;
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        let escape: Option<&[u8]> = match byte {
+            b'"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            0x08 => Some(b"\\b"),
+            0x0c => Some(b"\\f"),
+            b'\n' => Some(b"\\n"),
+            b'\r' => Some(b"\\r"),
+            b'\t' => Some(b"\\t"),
+            0x00..=0x1f => None,
+            _ => continue,
+        };
+        if start < index {
+            sink.write(&bytes[start..index])?;
+        }
+        match escape {
+            Some(sequence) => sink.write(sequence)?,
+            None => {
+                let sequence = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 0x0f) as usize],
+                ];
+                sink.write(&sequence)?;
+            }
+        }
+        start = index + 1;
+    }
+    if start < bytes.len() {
+        sink.write(&bytes[start..])?;
+    }
+    sink.byte(b'"')
 }
 
 /// Write Python objects as 2-space-indented JSON, matching
-/// `orjson.OPT_INDENT_2` output. Writing bytes directly avoids building an
-/// intermediate `serde_json::Value` tree for every save.
-fn write_json(out: &mut Vec<u8>, value: &Bound<'_, PyAny>, indent: usize) -> PyResult<()> {
+/// `orjson.OPT_INDENT_2` output, directly into the file sink.
+fn write_json(
+    sink: &mut JsonSink<'_>,
+    value: &Bound<'_, PyAny>,
+    indent: usize,
+) -> PyResult<()> {
     if value.is_none() {
-        out.extend_from_slice(b"null");
+        sink.write(b"null")?;
         return Ok(());
     }
     if let Ok(dict) = value.cast::<PyDict>() {
         let len = dict.len();
         if len == 0 {
-            out.extend_from_slice(b"{}");
+            sink.write(b"{}")?;
             return Ok(());
         }
-        out.extend_from_slice(b"{\n");
+        sink.write(b"{\n")?;
         for (index, (key, item)) in dict.iter().enumerate() {
-            write_indent(out, indent + 1);
+            write_indent(sink, indent + 1)?;
             let key = match key.cast::<PyString>() {
                 Ok(key) => key.to_string_lossy(),
                 Err(_) => return Err(PyTypeError::new_err("Dict key must be str")),
             };
-            write_json_string(out, &key);
-            out.extend_from_slice(b": ");
-            write_json(out, &item, indent + 1)?;
+            write_json_string(sink, &key)?;
+            sink.write(b": ")?;
+            write_json(sink, &item, indent + 1)?;
             if index + 1 < len {
-                out.push(b',');
+                sink.byte(b',')?;
             }
-            out.push(b'\n');
+            sink.byte(b'\n')?;
         }
-        write_indent(out, indent);
-        out.push(b'}');
+        write_indent(sink, indent)?;
+        sink.byte(b'}')?;
         return Ok(());
     }
     if let Ok(list) = value.cast::<PyList>() {
-        return write_json_array(out, list.as_any(), indent);
+        return write_json_array(sink, list.as_any(), indent);
     }
     if let Ok(tuple) = value.cast::<PyTuple>() {
-        return write_json_array(out, tuple.as_any(), indent);
+        return write_json_array(sink, tuple.as_any(), indent);
     }
     if let Ok(text) = value.cast::<PyString>() {
-        write_json_string(out, &text.to_string_lossy());
+        write_json_string(sink, &text.to_string_lossy())?;
         return Ok(());
     }
     if let Ok(boolean) = value.cast::<PyBool>() {
-        out.extend_from_slice(if boolean.is_true() { b"true" } else { b"false" });
+        sink.write(if boolean.is_true() { b"true" } else { b"false" })?;
         return Ok(());
     }
     if let Ok(integer) = value.cast::<PyInt>() {
         if let Ok(n) = integer.extract::<i64>() {
-            out.extend_from_slice(n.to_string().as_bytes());
+            sink.write(n.to_string().as_bytes())?;
         } else if let Ok(n) = integer.extract::<u64>() {
-            out.extend_from_slice(n.to_string().as_bytes());
+            sink.write(n.to_string().as_bytes())?;
         } else {
             let text = integer.str()?;
-            out.extend_from_slice(text.to_string_lossy().as_bytes());
+            sink.write(text.to_string_lossy().as_bytes())?;
         }
         return Ok(());
     }
     if let Ok(float) = value.cast::<PyFloat>() {
         match Number::from_f64(float.value()) {
-            Some(number) => out.extend_from_slice(number.to_string().as_bytes()),
-            None => out.extend_from_slice(b"null"),
+            Some(number) => sink.write(number.to_string().as_bytes())?,
+            None => sink.write(b"null")?,
         }
         return Ok(());
     }
@@ -133,36 +207,33 @@ fn write_json(out: &mut Vec<u8>, value: &Bound<'_, PyAny>, indent: usize) -> PyR
 }
 
 fn write_json_array(
-    out: &mut Vec<u8>,
+    sink: &mut JsonSink<'_>,
     values: &Bound<'_, PyAny>,
     indent: usize,
 ) -> PyResult<()> {
     let len = values.len()?;
     if len == 0 {
-        out.extend_from_slice(b"[]");
+        sink.write(b"[]")?;
         return Ok(());
     }
-    out.extend_from_slice(b"[\n");
+    sink.write(b"[\n")?;
     for (index, item) in values.try_iter()?.enumerate() {
         let item = item?;
-        write_indent(out, indent + 1);
-        write_json(out, &item, indent + 1)?;
+        write_indent(sink, indent + 1)?;
+        write_json(sink, &item, indent + 1)?;
         if index + 1 < len {
-            out.push(b',');
+            sink.byte(b',')?;
         }
-        out.push(b'\n');
+        sink.byte(b'\n')?;
     }
-    write_indent(out, indent);
-    out.push(b']');
+    write_indent(sink, indent)?;
+    sink.byte(b']')?;
     Ok(())
 }
 
 /// Serialize Python objects to pretty JSON and atomically replace `path`.
 pub fn save_file(py: Python<'_>, path: &Path, data: &Bound<'_, PyAny>) -> PyResult<()> {
     let _ = py;
-    let mut payload = Vec::new();
-    write_json(&mut payload, data, 0)?;
-
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -172,7 +243,11 @@ pub fn save_file(py: Python<'_>, path: &Path, data: &Bound<'_, PyAny>) -> PyResu
     let mut tmp = tempfile::Builder::new()
         .suffix(".tmp")
         .tempfile_in(dir)?;
-    tmp.write_all(&payload)?;
+    {
+        let mut sink = JsonSink::new(tmp.as_file_mut());
+        write_json(&mut sink, data, 0)?;
+        sink.flush()?;
+    }
     tmp.persist(path).map_err(|e| PyErr::from(e.error))?;
     Ok(())
 }

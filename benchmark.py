@@ -32,7 +32,7 @@ def main() -> None:
         # Build dataset
         docs = [
             {"name": f"user_{i}", "age": i % 100, "category": f"cat_{i % 10}"}
-            for i in range(5000_000)
+            for i in range(50_000)
         ]
 
         label, sec, _ = _time(
